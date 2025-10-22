@@ -1,0 +1,15 @@
+run_number,job_name,tool,phase,duration_s,run_id
+2,marp_build,none,baseline,24.000,18685305669
+3,marp_build,cachix,first,28.000,18685389246
+4,marp_build,cachix,second,26.000,18685468935
+7,marp_build,cache-nix-action,first,22.000,18685931719
+8,marp_build,cache-nix-action,second,10.000,18685999306
+9,marp_build,magic-nix-cache,first,31.000,18686193834
+10,marp_build,magic-nix-cache,second,46.000,18687785105
+2,zenn_build,none,baseline,53.000,18685305669
+3,zenn_build,cachix,first,74.000,18685389246
+4,zenn_build,cachix,second,30.000,18685468935
+7,zenn_build,cache-nix-action,first,99.000,18685931719
+8,zenn_build,cache-nix-action,second,8.000,18685999306
+9,zenn_build,magic-nix-cache,first,68.000,18686193834
+10,zenn_build,magic-nix-cache,second,53.000,18687785105
