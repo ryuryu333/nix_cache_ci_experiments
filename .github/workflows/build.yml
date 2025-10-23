@@ -10,7 +10,6 @@ on:
         options:
           - generate-cache
           - use-cache
-          - no-cache-tool
 
 jobs:
   build:
