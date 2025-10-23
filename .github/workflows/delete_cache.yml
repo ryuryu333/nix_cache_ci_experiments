@@ -7,4 +7,4 @@ jobs:
     steps:
       - uses: toshimaru/delete-action-cache@main
         with:
-          limit: 2000
+          limit: 3000
