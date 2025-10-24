@@ -314,7 +314,7 @@ def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path)
             plt.ylabel("seconds")
             plt.xticks(x, labels, rotation=30, ha="right")
             plt.tight_layout()
-            plt.savefig(out_dir / f"errorbars_means_{job}.png", dpi=150)
+            plt.savefig(out_dir / f"errorbars_build_{job}.png", dpi=150)
             plt.close()
         except Exception as e:
             print(f"errorbars plot failed for {job}: {e}")
