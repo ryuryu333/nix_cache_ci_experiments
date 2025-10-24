@@ -17,6 +17,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.uv
+            pkgs.gh
           ];
         };
       }
