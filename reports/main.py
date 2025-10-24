@@ -227,6 +227,11 @@ def plot_errorbars_job_totals(rows: List[BuildRow], job_totals: Dict[tuple, floa
         labels = []
         means = []
         stds = []
+        colors = []
+        def color_for(tool: str, phase: str) -> str:
+            if tool == "none":
+                return "#7F7F7F"
+            return "#4C78A8" if phase == "generate-cache" else "#F58518"
         for ph, tool in order:
             totals = []
             for r in jrows:
@@ -240,15 +245,26 @@ def plot_errorbars_job_totals(rows: List[BuildRow], job_totals: Dict[tuple, floa
             labels.append(_label(tool, ph))
             means.append(m)
             stds.append(std(totals) or 0.0)
+            colors.append(color_for(tool, ph))
         if not means:
             continue
         x = np.arange(len(means))
         try:
             plt.figure(figsize=(10, 4))
-            plt.bar(x, means, yerr=stds, capsize=4, color="#72B7B2", alpha=0.9)
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
             plt.title(f"{job} - Mean ± Std of job total (s)")
             plt.ylabel("seconds")
             plt.xticks(x, labels, rotation=30, ha="right")
+            try:
+                import matplotlib.patches as mpatches
+                legend_patches = [
+                    mpatches.Patch(color="#7F7F7F", label="no cache tool"),
+                    mpatches.Patch(color="#4C78A8", label="generate-cache"),
+                    mpatches.Patch(color="#F58518", label="use-cache"),
+                ]
+                plt.legend(handles=legend_patches, fontsize=8)
+            except Exception:
+                pass
             plt.tight_layout()
             plt.savefig(out_dir / f"errorbars_job_total_{job}.png", dpi=150)
             plt.close()
@@ -304,6 +320,12 @@ def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path)
         labels = []
         means = []
         stds = []
+        colors = []
+        def color_for(tool: str, phase: str) -> str:
+            # 3系統: no cache tool / generate / use
+            if tool == "none":
+                return "#7F7F7F"  # gray
+            return "#4C78A8" if phase == "generate-cache" else "#F58518"
         for ph, tool in order:
             m_s = data.get((job, tool, ph))
             if not m_s or m_s[0] is None:
@@ -311,16 +333,27 @@ def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path)
             labels.append(_label(tool, ph))
             means.append(m_s[0])
             stds.append(m_s[1] or 0.0)
+            colors.append(color_for(tool, ph))
         if not means:
             continue
         import numpy as np
         x = np.arange(len(means))
         try:
             plt.figure(figsize=(10, 4))
-            plt.bar(x, means, yerr=stds, capsize=4, color="#4C78A8", alpha=0.9)
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
             plt.title(f"{job} - Mean ± Std of Run nix build (s)")
             plt.ylabel("seconds")
             plt.xticks(x, labels, rotation=30, ha="right")
+            try:
+                import matplotlib.patches as mpatches
+                legend_patches = [
+                    mpatches.Patch(color="#7F7F7F", label="no cache tool"),
+                    mpatches.Patch(color="#4C78A8", label="generate-cache"),
+                    mpatches.Patch(color="#F58518", label="use-cache"),
+                ]
+                plt.legend(handles=legend_patches, fontsize=8)
+            except Exception:
+                pass
             plt.tight_layout()
             plt.savefig(out_dir / f"errorbars_build_{job}.png", dpi=150)
             plt.close()
