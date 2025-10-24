@@ -437,6 +437,91 @@ def write_summary_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out_
             ])
 
 
+def plot_compare_job_total_no_tool_vs_use(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    """Compare job total: no cache tool vs each tool(use-cache) in a single row.
+
+    Layout aligns with other charts: one bar per label arranged horizontally.
+    Labels order: [no cache tool] + [tool/use-cache ...]. Colors use the same
+    3-scheme (no cache tool=gray, use-cache=orange).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except Exception as e:
+        print(f"matplotlib の読み込みに失敗しました: {e}")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tools = ["cachix", "cache-nix-action", "magic-nix-cache"]
+
+    def mean(xs: List[float]):
+        return sum(xs) / len(xs) if xs else None
+
+    def std(xs: List[float]):
+        if len(xs) < 2:
+            return 0.0 if xs else None
+        m = mean(xs)
+        return ((sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5) if xs else None
+
+    for job in sorted({r.job_name for r in rows}):
+        jrows = [r for r in rows if r.job_name == job]
+        # Baseline candidates
+        base_vals = [
+            job_totals.get((r.run_id, r.job_name_raw))
+            for r in jrows
+            if r.tool == "none" and r.phase == "use-cache"
+        ]
+        base_vals = [v for v in base_vals if isinstance(v, float)]
+        if not base_vals:
+            base_vals = [
+                job_totals.get((r.run_id, r.job_name_raw))
+                for r in jrows
+                if r.tool == "none" and r.phase == "generate-cache"
+            ]
+            base_vals = [v for v in base_vals if isinstance(v, float)]
+        base_m = mean(base_vals)
+        base_s = std(base_vals)
+        if base_m is None:
+            continue
+
+        labels = ["no cache tool"]
+        means = [base_m]
+        stds = [base_s or 0.0]
+        colors = ["#7F7F7F"]
+
+        for tool in tools:
+            use_vals = [
+                job_totals.get((r.run_id, r.job_name_raw))
+                for r in jrows
+                if r.tool == tool and r.phase == "use-cache"
+            ]
+            use_vals = [v for v in use_vals if isinstance(v, float)]
+            if not use_vals:
+                continue
+            labels.append(_label(tool, "use-cache"))
+            means.append(mean(use_vals) or 0.0)
+            stds.append(std(use_vals) or 0.0)
+            colors.append("#F58518")
+
+        if len(labels) <= 1:
+            continue
+
+        x = np.arange(len(labels))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
+            plt.title(f"{job} - Job total: no cache tool vs use-cache")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            # draw baseline (no cache tool mean) as horizontal dashed line
+            plt.axhline(base_m, color="#7F7F7F", linestyle="--", linewidth=1)
+            plt.tight_layout()
+            plt.savefig(out_dir / f"compare_job_total_no_tool_vs_use_{job}.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"compare no_tool vs use plot failed for {job}: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze GitHub Actions nix build durations for specific cache tools")
     base_dir = Path(__file__).parent
@@ -477,6 +562,7 @@ def main():
     write_summary_csv(rows, job_totals, result_dir / "summary.csv")
     plot_errorbars_means(rows, result_dir / "summary.csv", args.fig_dir)
     plot_errorbars_job_totals(rows, job_totals, args.fig_dir)
+    plot_compare_job_total_no_tool_vs_use(rows, job_totals, args.fig_dir)
 
     print(f"wrote: {args.out_detail}")
     print(f"wrote: {args.out_speed}")
