@@ -198,106 +198,128 @@ def write_combined_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out
                 r.run_id,
             ])
 
+def plot_errorbars_job_totals(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    """Errorbar bars for job total duration (mean ± std) per tool/phase.
 
-def plot_total_vs_build(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    Aggregates totals across cycles for each label using jobs.csv-derived totals.
+    """
     try:
         import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"matplotlib の読み込みに失敗しました: {e}")
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    order = [
-        ("generate-cache", "none"),
-        ("generate-cache", "cachix"), ("use-cache", "cachix"),
-        ("generate-cache", "cache-nix-action"), ("use-cache", "cache-nix-action"),
-        ("generate-cache", "magic-nix-cache"), ("use-cache", "magic-nix-cache"),
-    ]
-
-    for job in sorted({r.job_name for r in rows}):
-        jrows = [r for r in rows if r.job_name == job]
-        labels: List[str] = []
-        totals: List[float] = []
-        builds: List[float] = []
-        for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
-                continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            tot = job_totals.get((r.run_id, r.job_name_raw))
-            if tot is None:
-                continue
-            labels.append(f"{tool}\n{ph}")
-            totals.append(tot)
-            builds.append(r.duration_s)
-
-        if not labels:
-            continue
-
         import numpy as np
-        x = np.arange(len(labels))
-        width = 0.38
-
-        plt.figure(figsize=(10, 4))
-        b1 = plt.bar(x - width/2, totals, width, label="job total", color="#4C78A8")
-        b2 = plt.bar(x + width/2, builds, width, label="build step", color="#F58518")
-        plt.title(f"{job} - Job total vs Run nix build (s)")
-        plt.ylabel("seconds")
-        plt.xticks(x, labels, rotation=30, ha="right")
-        plt.legend()
-        for bars in (b1, b2):
-            for b in bars:
-                h = b.get_height()
-                plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"total_vs_build_{job}.png", dpi=150)
-        plt.close()
-
-
-def plot_job_totals_only(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
-    try:
-        import matplotlib.pyplot as plt
     except Exception as e:
         print(f"matplotlib の読み込みに失敗しました: {e}")
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    order = [
+    order = _fixed_order_labels()
+
+    def mean(xs: List[float]):
+        return sum(xs) / len(xs) if xs else None
+
+    def std(xs: List[float]):
+        if len(xs) < 2:
+            return 0.0 if xs else None
+        m = mean(xs)
+        return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+
+    for job in sorted({r.job_name for r in rows}):
+        jrows = [r for r in rows if r.job_name == job]
+        labels = []
+        means = []
+        stds = []
+        for ph, tool in order:
+            totals = []
+            for r in jrows:
+                if r.phase == ph and r.tool == tool:
+                    tot = job_totals.get((r.run_id, r.job_name_raw))
+                    if isinstance(tot, float):
+                        totals.append(tot)
+            m = mean(totals)
+            if m is None:
+                continue
+            labels.append(f"{tool}\n{ph}")
+            means.append(m)
+            stds.append(std(totals) or 0.0)
+        if not means:
+            continue
+        x = np.arange(len(means))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color="#72B7B2", alpha=0.9)
+            plt.title(f"{job} - Mean ± Std of job total (s)")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            plt.tight_layout()
+            plt.savefig(out_dir / f"errorbars_job_total_{job}.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"job total errorbars failed for {job}: {e}")
+
+
+def _fixed_order_labels() -> List[tuple]:
+    return [
         ("generate-cache", "none"),
         ("generate-cache", "cachix"), ("use-cache", "cachix"),
         ("generate-cache", "cache-nix-action"), ("use-cache", "cache-nix-action"),
         ("generate-cache", "magic-nix-cache"), ("use-cache", "magic-nix-cache"),
     ]
 
+
+def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import csv as _csv
+    except Exception as e:
+        print(f"matplotlib の読み込みに失敗しました: {e}")
+        return
+
+    if not summary_csv.exists():
+        return
+    # Read summary to get mean/std per (job, tool, phase)
+    data = {}
+    with summary_csv.open() as f:
+        rdr = _csv.DictReader(f)
+        for r in rdr:
+            job = r["job_name"]
+            key = (job, r["tool"], r["phase"])
+            try:
+                mean = float(r["build_mean_s"]) if r["build_mean_s"] else None
+                std = float(r["build_std_s"]) if r["build_std_s"] else None
+            except ValueError:
+                mean = std = None
+            data[key] = (mean, std)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    order = _fixed_order_labels()
+
     for job in sorted({r.job_name for r in rows}):
-        jrows = [r for r in rows if r.job_name == job]
-        labels: List[str] = []
-        totals: List[float] = []
+        labels = []
+        means = []
+        stds = []
         for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
-                continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            tot = job_totals.get((r.run_id, r.job_name_raw))
-            if tot is None:
+            m_s = data.get((job, tool, ph))
+            if not m_s or m_s[0] is None:
                 continue
             labels.append(f"{tool}\n{ph}")
-            totals.append(tot)
-
-        if not labels:
+            means.append(m_s[0])
+            stds.append(m_s[1] or 0.0)
+        if not means:
             continue
+        import numpy as np
+        x = np.arange(len(means))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color="#4C78A8", alpha=0.9)
+            plt.title(f"{job} - Mean ± Std of Run nix build (s)")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            plt.tight_layout()
+            plt.savefig(out_dir / f"errorbars_means_{job}.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"errorbars plot failed for {job}: {e}")
 
-        plt.figure(figsize=(9, 4))
-        bars = plt.bar(range(len(totals)), totals, color="#4C78A8")
-        plt.title(f"{job} - Job total duration (s)")
-        plt.ylabel("seconds")
-        plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-        for i, b in enumerate(bars):
-            h = b.get_height()
-            plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"job_totals_{job}.png", dpi=150)
-        plt.close()
+
 def write_detail_csv(rows: List[BuildRow], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="") as f:
@@ -331,68 +353,6 @@ def write_speed_csv(rows: List[BuildRow], out_csv: Path) -> None:
             for r in sorted([x for x in rows if x.job_name == job], key=lambda x: (x.run_number, x.tool, x.phase)):
                 speed = (base / r.duration_s) if base and r.duration_s else None
                 w.writerow([job, r.tool, r.phase, r.run_number, f"{r.duration_s:.3f}", f"{speed:.3f}" if speed else ""])
-
-
-def plot_charts(rows: List[BuildRow], out_dir: Path) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"matplotlib の読み込みに失敗しました: {e}")
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 並び順を固定
-    order = [
-        ("generate-cache", "none"),
-        ("generate-cache", "cachix"), ("use-cache", "cachix"),
-        ("generate-cache", "cache-nix-action"), ("use-cache", "cache-nix-action"),
-        ("generate-cache", "magic-nix-cache"), ("use-cache", "magic-nix-cache"),
-    ]
-
-    for job in sorted({r.job_name for r in rows}):
-        jrows = [r for r in rows if r.job_name == job]
-        base = compute_baseline(rows, job)
-
-        labels = []
-        durations = []
-        speedups = []
-        for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
-                continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            labels.append(f"{tool}\n{ph}")
-            durations.append(r.duration_s)
-            speedups.append((base / r.duration_s) if base else None)
-
-        # Duration chart（各ラベルの最初の観測値を使用）
-        plt.figure(figsize=(9, 4))
-        bars = plt.bar(range(len(durations)), durations, color="#4C78A8")
-        plt.title(f"{job} - Run nix build duration (s) [first per label]")
-        plt.ylabel("seconds")
-        plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-        for i, b in enumerate(bars):
-            h = b.get_height()
-            plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"durations_{job}.png", dpi=150)
-        plt.close()
-
-        # Speedup chart
-        if base:
-            plt.figure(figsize=(9, 4))
-            bars = plt.bar(range(len(speedups)), speedups, color="#72B7B2")
-            plt.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-            plt.title(f"{job} - Speedup vs baseline (none/generate-cache mean)")
-            plt.ylabel("x faster (baseline=1.0)")
-            plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-            for i, b in enumerate(bars):
-                h = b.get_height()
-                plt.text(b.get_x() + b.get_width()/2, h, f"{h:.2f}x", ha="center", va="bottom", fontsize=8)
-            plt.tight_layout()
-            plt.savefig(out_dir / f"speedup_{job}.png", dpi=150)
-            plt.close()
 
 
 def write_summary_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out_csv: Path) -> None:
@@ -474,9 +434,8 @@ def main():
     job_totals = load_job_totals(jobs_p, runs_p)
     write_combined_csv(rows, job_totals, args.out_combined)
     write_summary_csv(rows, job_totals, result_dir / "summary.csv")
-    plot_charts(rows, args.fig_dir)
-    plot_total_vs_build(rows, job_totals, args.fig_dir)
-    plot_job_totals_only(rows, job_totals, args.fig_dir)
+    plot_errorbars_means(rows, result_dir / "summary.csv", args.fig_dir)
+    plot_errorbars_job_totals(rows, job_totals, args.fig_dir)
 
     print(f"wrote: {args.out_detail}")
     print(f"wrote: {args.out_speed}")
