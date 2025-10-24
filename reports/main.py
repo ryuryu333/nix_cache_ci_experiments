@@ -237,7 +237,7 @@ def plot_errorbars_job_totals(rows: List[BuildRow], job_totals: Dict[tuple, floa
             m = mean(totals)
             if m is None:
                 continue
-            labels.append(f"{tool}\n{ph}")
+            labels.append(_label(tool, ph))
             means.append(m)
             stds.append(std(totals) or 0.0)
         if not means:
@@ -263,6 +263,14 @@ def _fixed_order_labels() -> List[tuple]:
         ("generate-cache", "cache-nix-action"), ("use-cache", "cache-nix-action"),
         ("generate-cache", "magic-nix-cache"), ("use-cache", "magic-nix-cache"),
     ]
+
+
+def _tool_label(tool: str) -> str:
+    return "no cache tool" if tool == "none" else tool
+
+def _label(tool: str, phase: str) -> str:
+    name = _tool_label(tool)
+    return name if tool == "none" else f"{name}\n{phase}"
 
 
 def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path) -> None:
@@ -300,7 +308,7 @@ def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path)
             m_s = data.get((job, tool, ph))
             if not m_s or m_s[0] is None:
                 continue
-            labels.append(f"{tool}\n{ph}")
+            labels.append(_label(tool, ph))
             means.append(m_s[0])
             stds.append(m_s[1] or 0.0)
         if not means:
