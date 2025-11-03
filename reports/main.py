@@ -2,40 +2,45 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass
 class BuildRow:
     run_id: str
     run_number: int
-    job_name: str
-    tool: str  # none | cachix | cache-nix-action | magic-nix-cache | mixed
-    phase: str  # baseline | first | second | other
+    job_name_raw: str
+    job_name: str  # friendly: "marp_build" | "zenn_build"
+    target: str  # marp | zenn
+    tool: str  # none | cachix | cache-nix-action | magic-nix-cache
+    phase: str  # generate-cache | use-cache | other
     duration_s: float
 
 
-# 検出ルール（ステップ名に含まれる文字列）
-CACHE_KEYWORDS = {
-    "magic-nix-cache": ["DeterminateSystems/magic-nix-cache-action"],
-    "cachix": ["cachix/cachix-action"],
-    "cache-nix-action": ["cache-nix-action"],
-}
+@dataclass
+class AllowedEntry:
+    """Represents a single analysis target run.
+
+    Selection CSV lists run_id (and optional run_number, note). All build_* jobs
+    within the listed runs are included in analysis.
+    """
+    run_id: str
+    run_number: Optional[int] = None
+    note: str = ""
 
 
-TARGET_RUNS = {2, 3, 4, 7, 8, 9, 10}
-BASELINE_RUN = 2
-TOOL_BY_RUN_NUMBER = {
-    2: "none",
-    3: "cachix",
-    4: "cachix",
-    7: "cache-nix-action",
-    8: "cache-nix-action",
-    9: "magic-nix-cache",
-    10: "magic-nix-cache",
+# ジョブ名から target/tool/phase を抽出する正規表現
+JOB_NAME_RE = re.compile(r"^build_(?P<target>[^_]+)_cachetool_(?P<tool>[^_]+)_phase_(?P<phase>.+)$")
+
+TOOL_NORMALIZE = {
+    "none": "none",
+    "cachix-action": "cachix",
+    "cache-nix-action": "cache-nix-action",
+    "magic-nix-cache-action": "magic-nix-cache",
 }
 
 
@@ -44,24 +49,46 @@ def read_csv(path: Path) -> List[dict]:
         return list(csv.DictReader(f))
 
 
-def map_run_cache(step_rows: Iterable[dict]) -> Dict[str, str]:
-    flags: Dict[str, Dict[str, bool]] = defaultdict(lambda: defaultdict(bool))
-    for r in step_rows:
-        run_id = r["run_id"].strip('"')
-        name = r.get("step_name", "")
-        for tool, needles in CACHE_KEYWORDS.items():
-            if any(n in name for n in needles):
-                flags[run_id][tool] = True
-    tools: Dict[str, str] = {}
-    for run_id, d in flags.items():
-        found = [k for k, v in d.items() if v]
-        if not found:
-            tools[run_id] = "none"
-        elif len(found) == 1:
-            tools[run_id] = found[0]
-        else:
-            tools[run_id] = "+".join(sorted(found))
-    return tools
+def read_selection_csv(path: Optional[Path]) -> List[AllowedEntry]:
+    rules: List[AllowedEntry] = []
+    if not path:
+        raise FileNotFoundError("--selection-csv is required for analysis")
+    if not path.exists():
+        raise FileNotFoundError(f"selection csv not found: {path}")
+    rows = read_csv(path)
+    for r in rows:
+        run_id = (r.get("run_id") or "").strip('"')
+        rn_s = (r.get("run_number") or r.get("run_no") or "").strip()
+        note = (r.get("note") or r.get("reason") or "").strip()
+        if not run_id:
+            continue
+        try:
+            rn = int(rn_s) if rn_s else None
+        except Exception:
+            rn = None
+        rules.append(AllowedEntry(run_id=run_id, run_number=rn, note=note))
+    return rules
+
+
+def make_selector(rules: List[AllowedEntry]):
+    """Whitelist selector: include all build_* jobs for listed run_id(s)."""
+    allowed_runs = {r.run_id for r in rules}
+
+    def include(run_id: str, job_name_raw: str) -> bool:
+        return run_id in allowed_runs
+
+    return include
+
+
+def parse_job(job_name: str) -> Optional[Tuple[str, str, str]]:
+    m = JOB_NAME_RE.match(job_name)
+    if not m:
+        return None
+    target = m.group("target")
+    raw_tool = m.group("tool")
+    phase = m.group("phase")
+    tool = TOOL_NORMALIZE.get(raw_tool, raw_tool)
+    return target, tool, phase
 
 
 def map_run_number(run_rows: Iterable[dict]) -> Dict[str, int]:
@@ -74,20 +101,9 @@ def map_run_number(run_rows: Iterable[dict]) -> Dict[str, int]:
     return out
 
 
-def phase_from_run_number(run_number: int) -> str:
-    if run_number == BASELINE_RUN:
-        return "baseline"
-    if run_number in {3, 7, 9}:
-        return "first"
-    if run_number in {4, 8, 10}:
-        return "second"
-    return "other"
-
-
-def load_build_rows(steps_csv: Path, runs_csv: Path) -> List[BuildRow]:
+def load_build_rows(steps_csv: Path, runs_csv: Path, selector=None) -> List[BuildRow]:
     steps = read_csv(steps_csv)
     runs = read_csv(runs_csv)
-    tool_by_run = map_run_cache(steps)
     rn_by_run = map_run_number(runs)
 
     rows: List[BuildRow] = []
@@ -101,27 +117,46 @@ def load_build_rows(steps_csv: Path, runs_csv: Path) -> List[BuildRow]:
             duration = float(dur)
         except ValueError:
             continue
+        if duration <= 0:
+            # 無効（skip/計測不能）の可能性が高いので除外
+            continue
         run_id = r["run_id"].strip('"')
         run_number = rn_by_run.get(run_id)
         if run_number is None:
             continue
-        detected = tool_by_run.get(run_id, "none")
-        tool = TOOL_BY_RUN_NUMBER.get(run_number, detected)
+        job_name_raw = r.get("job_name", "")
+        if selector and not selector(run_id, job_name_raw):
+            continue
+        parsed = parse_job(job_name_raw)
+        if not parsed:
+            # 現行ワークフロー以外のジョブは除外
+            continue
+        target, tool, phase = parsed
+        job_name_friendly = f"{target}_build"
         rows.append(
             BuildRow(
                 run_id=run_id,
                 run_number=run_number,
-                job_name=r.get("job_name", ""),
+                job_name_raw=job_name_raw,
+                job_name=job_name_friendly,
+                target=target,
                 tool=tool,
-                phase=phase_from_run_number(run_number),
+                phase=phase,
                 duration_s=duration,
             )
         )
     return rows
 
-
-def filter_target(rows: List[BuildRow]) -> List[BuildRow]:
-    return [r for r in rows if r.run_number in TARGET_RUNS]
+def group_cycle_index(rows: List[BuildRow]) -> Dict[Tuple[str, str, str], Dict[str, int]]:
+    """各 (target, tool, phase) の組み合わせ内で run_number に基づき 1..N のサイクル番号を割り当てる。"""
+    mapping: Dict[Tuple[str, str, str], Dict[str, int]] = {}
+    bucket: Dict[Tuple[str, str, str], List[BuildRow]] = defaultdict(list)
+    for r in rows:
+        bucket[(r.target, r.tool, r.phase)].append(r)
+    for key, lst in bucket.items():
+        lst_sorted = sorted(lst, key=lambda x: x.run_number)
+        mapping[key] = {r.run_id: i + 1 for i, r in enumerate(lst_sorted)}
+    return mapping
 
 
 def load_job_totals(jobs_csv: Path, runs_csv: Path) -> Dict[tuple, float]:
@@ -140,10 +175,6 @@ def load_job_totals(jobs_csv: Path, runs_csv: Path) -> Dict[tuple, float]:
             d = None
         if not run_id or d is None:
             continue
-        # Keep only target runs
-        rn = rn_by_run.get(run_id)
-        if rn not in TARGET_RUNS:
-            continue
         totals[(run_id, job_name)] = d
     return totals
 
@@ -154,7 +185,7 @@ def write_combined_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out
         w = csv.writer(f)
         w.writerow(["run_number", "job_name", "tool", "phase", "build_s", "job_total_s", "build_share", "run_id"])
         for r in sorted(rows, key=lambda x: (x.job_name, x.run_number, x.tool)):
-            tot = job_totals.get((r.run_id, r.job_name))
+            tot = job_totals.get((r.run_id, r.job_name_raw))
             share = (r.duration_s / tot) if (tot and tot > 0) else ""
             w.writerow([
                 r.run_number,
@@ -167,118 +198,190 @@ def write_combined_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out
                 r.run_id,
             ])
 
+def plot_errorbars_job_totals(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    """Errorbar bars for job total duration (mean ± std) per tool/phase.
 
-def plot_total_vs_build(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    Aggregates totals across cycles for each label using jobs.csv-derived totals.
+    """
     try:
         import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"matplotlib の読み込みに失敗しました: {e}")
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    order = [
-        ("baseline", "none"),
-        ("first", "cachix"), ("second", "cachix"),
-        ("first", "cache-nix-action"), ("second", "cache-nix-action"),
-        ("first", "magic-nix-cache"), ("second", "magic-nix-cache"),
-    ]
-
-    for job in sorted({r.job_name for r in rows}):
-        jrows = [r for r in rows if r.job_name == job]
-        labels: List[str] = []
-        totals: List[float] = []
-        builds: List[float] = []
-        for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
-                continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            tot = job_totals.get((r.run_id, r.job_name))
-            if tot is None:
-                continue
-            labels.append(f"{tool}\n{ph}")
-            totals.append(tot)
-            builds.append(r.duration_s)
-
-        if not labels:
-            continue
-
         import numpy as np
-        x = np.arange(len(labels))
-        width = 0.38
-
-        plt.figure(figsize=(10, 4))
-        b1 = plt.bar(x - width/2, totals, width, label="job total", color="#4C78A8")
-        b2 = plt.bar(x + width/2, builds, width, label="build step", color="#F58518")
-        plt.title(f"{job} - Job total vs Run nix build (s)")
-        plt.ylabel("seconds")
-        plt.xticks(x, labels, rotation=30, ha="right")
-        plt.legend()
-        for bars in (b1, b2):
-            for b in bars:
-                h = b.get_height()
-                plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"total_vs_build_{job}.png", dpi=150)
-        plt.close()
-
-
-def plot_job_totals_only(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
-    try:
-        import matplotlib.pyplot as plt
     except Exception as e:
         print(f"matplotlib の読み込みに失敗しました: {e}")
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    order = [
-        ("baseline", "none"),
-        ("first", "cachix"), ("second", "cachix"),
-        ("first", "cache-nix-action"), ("second", "cache-nix-action"),
-        ("first", "magic-nix-cache"), ("second", "magic-nix-cache"),
-    ]
+    order = _fixed_order_labels()
+
+    def mean(xs: List[float]):
+        return sum(xs) / len(xs) if xs else None
+
+    def std(xs: List[float]):
+        if len(xs) < 2:
+            return 0.0 if xs else None
+        m = mean(xs)
+        return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
     for job in sorted({r.job_name for r in rows}):
         jrows = [r for r in rows if r.job_name == job]
-        labels: List[str] = []
-        totals: List[float] = []
+        labels = []
+        means = []
+        stds = []
+        colors = []
+        def color_for(tool: str, phase: str) -> str:
+            if tool == "none":
+                return "#7F7F7F"
+            return "#4C78A8" if phase == "generate-cache" else "#F58518"
         for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
+            totals = []
+            for r in jrows:
+                if r.phase == ph and r.tool == tool:
+                    tot = job_totals.get((r.run_id, r.job_name_raw))
+                    if isinstance(tot, float):
+                        totals.append(tot)
+            m = mean(totals)
+            if m is None:
                 continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            tot = job_totals.get((r.run_id, r.job_name))
-            if tot is None:
-                continue
-            labels.append(f"{tool}\n{ph}")
-            totals.append(tot)
-
-        if not labels:
+            labels.append(_label(tool, ph))
+            means.append(m)
+            stds.append(std(totals) or 0.0)
+            colors.append(color_for(tool, ph))
+        if not means:
             continue
+        x = np.arange(len(means))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
+            plt.title(f"{job} - Mean ± Std of job total (s)")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            try:
+                import matplotlib.patches as mpatches
+                legend_patches = [
+                    mpatches.Patch(color="#7F7F7F", label="no cache tool"),
+                    mpatches.Patch(color="#4C78A8", label="generate-cache"),
+                    mpatches.Patch(color="#F58518", label="use-cache"),
+                ]
+                plt.legend(handles=legend_patches, fontsize=8)
+            except Exception:
+                pass
+            plt.tight_layout()
+            plt.savefig(out_dir / f"errorbars_job_total_{job}.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"job total errorbars failed for {job}: {e}")
 
-        plt.figure(figsize=(9, 4))
-        bars = plt.bar(range(len(totals)), totals, color="#4C78A8")
-        plt.title(f"{job} - Job total duration (s)")
-        plt.ylabel("seconds")
-        plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-        for i, b in enumerate(bars):
-            h = b.get_height()
-            plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"job_totals_{job}.png", dpi=150)
-        plt.close()
+
+def _fixed_order_labels() -> List[tuple]:
+    return [
+        ("generate-cache", "none"),
+        ("generate-cache", "cachix"), ("use-cache", "cachix"),
+        ("generate-cache", "cache-nix-action"), ("use-cache", "cache-nix-action"),
+        ("generate-cache", "magic-nix-cache"), ("use-cache", "magic-nix-cache"),
+    ]
+
+
+def _tool_label(tool: str) -> str:
+    return "no cache tool" if tool == "none" else tool
+
+def _label(tool: str, phase: str) -> str:
+    name = _tool_label(tool)
+    return name if tool == "none" else f"{name}\n{phase}"
+
+
+def plot_errorbars_means(rows: List[BuildRow], summary_csv: Path, out_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import csv as _csv
+    except Exception as e:
+        print(f"matplotlib の読み込みに失敗しました: {e}")
+        return
+
+    if not summary_csv.exists():
+        return
+    # Read summary to get mean/std per (job, tool, phase)
+    data = {}
+    with summary_csv.open() as f:
+        rdr = _csv.DictReader(f)
+        for r in rdr:
+            job = r["job_name"]
+            key = (job, r["tool"], r["phase"])
+            try:
+                mean = float(r["build_mean_s"]) if r["build_mean_s"] else None
+                std = float(r["build_std_s"]) if r["build_std_s"] else None
+            except ValueError:
+                mean = std = None
+            data[key] = (mean, std)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    order = _fixed_order_labels()
+
+    for job in sorted({r.job_name for r in rows}):
+        labels = []
+        means = []
+        stds = []
+        colors = []
+        def color_for(tool: str, phase: str) -> str:
+            # 3系統: no cache tool / generate / use
+            if tool == "none":
+                return "#7F7F7F"  # gray
+            return "#4C78A8" if phase == "generate-cache" else "#F58518"
+        for ph, tool in order:
+            m_s = data.get((job, tool, ph))
+            if not m_s or m_s[0] is None:
+                continue
+            labels.append(_label(tool, ph))
+            means.append(m_s[0])
+            stds.append(m_s[1] or 0.0)
+            colors.append(color_for(tool, ph))
+        if not means:
+            continue
+        import numpy as np
+        x = np.arange(len(means))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
+            plt.title(f"{job} - Mean ± Std of Run nix build (s)")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            try:
+                import matplotlib.patches as mpatches
+                legend_patches = [
+                    mpatches.Patch(color="#7F7F7F", label="no cache tool"),
+                    mpatches.Patch(color="#4C78A8", label="generate-cache"),
+                    mpatches.Patch(color="#F58518", label="use-cache"),
+                ]
+                plt.legend(handles=legend_patches, fontsize=8)
+            except Exception:
+                pass
+            plt.tight_layout()
+            plt.savefig(out_dir / f"errorbars_build_{job}.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"errorbars plot failed for {job}: {e}")
+
+
 def write_detail_csv(rows: List[BuildRow], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["run_number", "job_name", "tool", "phase", "duration_s", "run_id"])
-        for r in sorted(rows, key=lambda x: (x.job_name, x.run_number, x.tool)):
-            w.writerow([r.run_number, r.job_name, r.tool, r.phase, f"{r.duration_s:.3f}", r.run_id])
+        idx_map = group_cycle_index(rows)
+        w.writerow(["run_number", "job_name", "tool", "phase", "cycle_index", "duration_s", "run_id"])
+        for r in sorted(rows, key=lambda x: (x.job_name, x.tool, x.phase, x.run_number)):
+            cidx = idx_map.get((r.target, r.tool, r.phase), {}).get(r.run_id, "")
+            w.writerow([r.run_number, r.job_name, r.tool, r.phase, cidx, f"{r.duration_s:.3f}", r.run_id])
 
 
 def compute_baseline(rows: List[BuildRow], job_name: str) -> Optional[float]:
-    vals = [r.duration_s for r in rows if r.job_name == job_name and r.run_number == BASELINE_RUN]
-    return vals[0] if vals else None
+    # ベースラインは tool=none かつ phase=generate-cache の平均
+    vals = [
+        r.duration_s
+        for r in rows
+        if r.job_name == job_name and r.tool == "none" and r.phase == "generate-cache"
+    ]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
 
 
 def write_speed_csv(rows: List[BuildRow], out_csv: Path) -> None:
@@ -288,71 +391,135 @@ def write_speed_csv(rows: List[BuildRow], out_csv: Path) -> None:
         w.writerow(["job_name", "tool", "phase", "run_number", "duration_s", "speedup_vs_baseline"])
         for job in sorted({r.job_name for r in rows}):
             base = compute_baseline(rows, job)
-            for r in sorted([x for x in rows if x.job_name == job], key=lambda x: (x.run_number, x.tool)):
+            for r in sorted([x for x in rows if x.job_name == job], key=lambda x: (x.run_number, x.tool, x.phase)):
                 speed = (base / r.duration_s) if base and r.duration_s else None
                 w.writerow([job, r.tool, r.phase, r.run_number, f"{r.duration_s:.3f}", f"{speed:.3f}" if speed else ""])
 
 
-def plot_charts(rows: List[BuildRow], out_dir: Path) -> None:
+def write_summary_csv(rows: List[BuildRow], job_totals: Dict[tuple, float], out_csv: Path) -> None:
+    from math import sqrt
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    grouped: Dict[Tuple[str, str, str], List[Tuple[float, Optional[float]]]] = defaultdict(list)
+    for r in rows:
+        tot = job_totals.get((r.run_id, r.job_name_raw))
+        grouped[(r.job_name, r.tool, r.phase)].append((r.duration_s, tot))
+
+    def mean(xs: List[float]) -> Optional[float]:
+        return sum(xs) / len(xs) if xs else None
+
+    def std(xs: List[float]) -> Optional[float]:
+        if len(xs) < 2:
+            return 0.0 if xs else None
+        m = mean(xs)
+        return sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+    with out_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "job_name", "tool", "phase", "n", "build_mean_s", "build_std_s", "job_total_mean_s", "build_share_mean",
+        ])
+        for key in sorted(grouped.keys()):
+            vals = grouped[key]
+            build_vals = [b for (b, _) in vals if isinstance(b, float)]
+            total_vals = [t for (_, t) in vals if isinstance(t, float)]
+            share_vals = [b / t for (b, t) in vals if isinstance(t, float) and t > 0]
+            bm = mean(build_vals)
+            bs = std(build_vals)
+            tm = mean(total_vals)
+            sm = mean(share_vals)
+            w.writerow([
+                key[0], key[1], key[2], len(vals),
+                f"{bm:.3f}" if bm is not None else "",
+                f"{bs:.3f}" if bs is not None else "",
+                f"{tm:.3f}" if tm is not None else "",
+                f"{sm:.3f}" if sm is not None else "",
+            ])
+
+
+def plot_compare_job_total_no_tool_vs_use(rows: List[BuildRow], job_totals: Dict[tuple, float], out_dir: Path) -> None:
+    """Compare job total: no cache tool vs each tool(use-cache) in a single row.
+
+    Layout aligns with other charts: one bar per label arranged horizontally.
+    Labels order: [no cache tool] + [tool/use-cache ...]. Colors use the same
+    3-scheme (no cache tool=gray, use-cache=orange).
+    """
     try:
         import matplotlib.pyplot as plt
+        import numpy as np
     except Exception as e:
         print(f"matplotlib の読み込みに失敗しました: {e}")
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    tools = ["cachix", "cache-nix-action", "magic-nix-cache"]
 
-    # 並び順を固定
-    order = [
-        ("baseline", "none"),
-        ("first", "cachix"), ("second", "cachix"),
-        ("first", "cache-nix-action"), ("second", "cache-nix-action"),
-        ("first", "magic-nix-cache"), ("second", "magic-nix-cache"),
-    ]
+    def mean(xs: List[float]):
+        return sum(xs) / len(xs) if xs else None
+
+    def std(xs: List[float]):
+        if len(xs) < 2:
+            return 0.0 if xs else None
+        m = mean(xs)
+        return ((sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5) if xs else None
 
     for job in sorted({r.job_name for r in rows}):
         jrows = [r for r in rows if r.job_name == job]
-        base = compute_baseline(rows, job)
+        # Baseline candidates
+        base_vals = [
+            job_totals.get((r.run_id, r.job_name_raw))
+            for r in jrows
+            if r.tool == "none" and r.phase == "use-cache"
+        ]
+        base_vals = [v for v in base_vals if isinstance(v, float)]
+        if not base_vals:
+            base_vals = [
+                job_totals.get((r.run_id, r.job_name_raw))
+                for r in jrows
+                if r.tool == "none" and r.phase == "generate-cache"
+            ]
+            base_vals = [v for v in base_vals if isinstance(v, float)]
+        base_m = mean(base_vals)
+        base_s = std(base_vals)
+        if base_m is None:
+            continue
 
-        labels = []
-        durations = []
-        speedups = []
-        for ph, tool in order:
-            match = [r for r in jrows if r.phase == ph and r.tool == tool]
-            if not match:
+        labels = ["no cache tool"]
+        means = [base_m]
+        stds = [base_s or 0.0]
+        colors = ["#7F7F7F"]
+
+        for tool in tools:
+            use_vals = [
+                job_totals.get((r.run_id, r.job_name_raw))
+                for r in jrows
+                if r.tool == tool and r.phase == "use-cache"
+            ]
+            use_vals = [v for v in use_vals if isinstance(v, float)]
+            if not use_vals:
                 continue
-            r = sorted(match, key=lambda x: x.run_number)[0]
-            labels.append(f"{tool}\n{ph}")
-            durations.append(r.duration_s)
-            speedups.append((base / r.duration_s) if base else None)
+            labels.append(_label(tool, "use-cache"))
+            means.append(mean(use_vals) or 0.0)
+            stds.append(std(use_vals) or 0.0)
+            colors.append("#F58518")
 
-        # Duration chart
-        plt.figure(figsize=(9, 4))
-        bars = plt.bar(range(len(durations)), durations, color="#4C78A8")
-        plt.title(f"{job} - Run nix build duration (s)")
-        plt.ylabel("seconds")
-        plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-        for i, b in enumerate(bars):
-            h = b.get_height()
-            plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}s", ha="center", va="bottom", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"durations_{job}.png", dpi=150)
-        plt.close()
+        if len(labels) <= 1:
+            continue
 
-        # Speedup chart
-        if base:
-            plt.figure(figsize=(9, 4))
-            bars = plt.bar(range(len(speedups)), speedups, color="#72B7B2")
-            plt.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-            plt.title(f"{job} - Speedup vs baseline (run {BASELINE_RUN})")
-            plt.ylabel("x faster (baseline=1.0)")
-            plt.xticks(range(len(labels)), labels, rotation=30, ha="right")
-            for i, b in enumerate(bars):
-                h = b.get_height()
-                plt.text(b.get_x() + b.get_width()/2, h, f"{h:.2f}x", ha="center", va="bottom", fontsize=8)
+        x = np.arange(len(labels))
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.9)
+            plt.title(f"{job} - Job total: no cache tool vs use-cache")
+            plt.ylabel("seconds")
+            plt.xticks(x, labels, rotation=30, ha="right")
+            # draw baseline (no cache tool mean) as horizontal dashed line
+            plt.axhline(base_m, color="#7F7F7F", linestyle="--", linewidth=1)
             plt.tight_layout()
-            plt.savefig(out_dir / f"speedup_{job}.png", dpi=150)
+            plt.savefig(out_dir / f"compare_job_total_no_tool_vs_use_{job}.png", dpi=150)
             plt.close()
+        except Exception as e:
+            print(f"compare no_tool vs use plot failed for {job}: {e}")
 
 
 def main():
@@ -361,30 +528,46 @@ def main():
     # デフォルトの入力は actions_log/ 配下へ変更
     log_dir = base_dir / "actions_log"
     result_dir = base_dir / "my_result"
-    parser.add_argument("--steps", type=Path, default=log_dir / "actions_steps.csv", help="Path to actions_steps.csv")
-    parser.add_argument("--runs", type=Path, default=log_dir / "actions_runs.csv", help="Path to actions_runs.csv")
-    parser.add_argument("--jobs", type=Path, default=log_dir / "actions_jobs.csv", help="Path to actions_jobs.csv")
+    # 入力は reports/actions_log 固定
+    steps_p = log_dir / "actions_steps.csv"
+    runs_p = log_dir / "actions_runs.csv"
+    jobs_p = log_dir / "actions_jobs.csv"
     # 出力先は result/ 配下へ
     parser.add_argument("--out-detail", type=Path, default=result_dir / "detail.csv", help="Detailed rows CSV")
     parser.add_argument("--out-speed", type=Path, default=result_dir / "speedup.csv", help="Speedup CSV")
     parser.add_argument("--out-combined", type=Path, default=result_dir / "combined.csv", help="Combined build vs total CSV")
     parser.add_argument("--fig-dir", type=Path, default=result_dir / "figures", help="Output figures directory")
+    parser.add_argument("--selection-csv", type=Path, default=log_dir / "selection.csv", help="Whitelist CSV. Columns: run_id[, run_number, note]")
     args = parser.parse_args()
 
-    rows = load_build_rows(args.steps, args.runs)
-    rows = filter_target(rows)
+    rules = read_selection_csv(args.selection_csv)
+    selector = make_selector(rules)
+
+    # Validate expected CSV locations under reports/actions_log
+    missing = [p for p in [steps_p, runs_p, jobs_p, args.selection_csv] if not p.exists()]
+    if missing:
+        msg = ["Input CSV missing under reports/actions_log:"]
+        for p in missing:
+            msg.append(f" - {p}")
+        msg.append("Place actions_runs.csv, actions_jobs.csv, actions_steps.csv, selection.csv in reports/actions_log.")
+        msg.append("You can fetch them via: OWNER=<OWNER> REPO=<REPO> WORKFLOW=build.yml OUTDIR=reports/actions_log GH_TOKEN=$GH_TOKEN bash reports/actions_log/export_actions_csv.sh")
+        raise FileNotFoundError("\n".join(msg))
+
+    rows = load_build_rows(steps_p, runs_p, selector=selector)
 
     write_detail_csv(rows, args.out_detail)
     write_speed_csv(rows, args.out_speed)
-    job_totals = load_job_totals(args.jobs, args.runs)
+    job_totals = load_job_totals(jobs_p, runs_p)
     write_combined_csv(rows, job_totals, args.out_combined)
-    plot_charts(rows, args.fig_dir)
-    plot_total_vs_build(rows, job_totals, args.fig_dir)
-    plot_job_totals_only(rows, job_totals, args.fig_dir)
+    write_summary_csv(rows, job_totals, result_dir / "summary.csv")
+    plot_errorbars_means(rows, result_dir / "summary.csv", args.fig_dir)
+    plot_errorbars_job_totals(rows, job_totals, args.fig_dir)
+    plot_compare_job_total_no_tool_vs_use(rows, job_totals, args.fig_dir)
 
     print(f"wrote: {args.out_detail}")
     print(f"wrote: {args.out_speed}")
     print(f"wrote: {args.out_combined}")
+    print(f"wrote: {result_dir / 'summary.csv'}")
     print(f"figures: {args.fig_dir}/*.png")
 
 

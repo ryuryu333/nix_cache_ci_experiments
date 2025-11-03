@@ -1,0 +1,17 @@
+job_name,tool,phase,n,build_mean_s,build_std_s,job_total_mean_s,build_share_mean
+marp_build,cache-nix-action,generate-cache,4,22.500,0.577,45.500,0.496
+marp_build,cache-nix-action,use-cache,4,9.250,0.500,31.750,0.295
+marp_build,cachix,generate-cache,4,26.500,1.732,42.750,0.620
+marp_build,cachix,use-cache,4,25.250,1.500,42.000,0.604
+marp_build,magic-nix-cache,generate-cache,4,30.000,0.816,428.500,0.073
+marp_build,magic-nix-cache,use-cache,4,30.750,6.702,54.000,0.567
+marp_build,none,generate-cache,4,23.500,1.000,35.250,0.668
+marp_build,none,use-cache,4,24.000,0.816,36.500,0.659
+zenn_build,cache-nix-action,generate-cache,4,85.750,12.816,108.250,0.790
+zenn_build,cache-nix-action,use-cache,4,9.000,0.000,29.750,0.307
+zenn_build,cachix,generate-cache,4,70.000,3.559,99.000,0.710
+zenn_build,cachix,use-cache,4,21.250,5.795,40.500,0.518
+zenn_build,magic-nix-cache,generate-cache,4,68.000,2.944,377.000,0.199
+zenn_build,magic-nix-cache,use-cache,4,38.500,17.330,66.500,0.565
+zenn_build,none,generate-cache,4,56.750,0.957,72.500,0.783
+zenn_build,none,use-cache,4,51.500,5.066,66.250,0.776
